@@ -1,3 +1,17 @@
+/**
+ * Alyxar Worker — Full file through Phase 3
+ *
+ * Bindings (Dashboard):
+ * - env.DB (D1)
+ * - env.FEED_BUCKET (R2)
+ * - env.ADMIN_KEY (secret)
+ *
+ * Optional vars:
+ * - env.FEEDS_PREFIX (default: "feeds")
+ * - env.LUMEN_FEED_LIMIT (default: 10)
+ * - env.MAX_ACTIVE_VIDEOS_PER_CREATOR (default: 10)
+ */
+
 const ADMIN_COOKIE_NAME = "admin_session";
 const ADMIN_SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30; // 30 days
 
@@ -33,7 +47,17 @@ export default {
         if (!(await requireAdminSession(request, env))) {
           return json({ error: "Unauthorized" }, 401, { "cache-control": "no-store" });
         }
+      if (path === "/admin/api/game-tags" && method === "GET") {
+        return adminListGameTags(env);
+      }
 
+      if (path === "/admin/api/game-tags/upsert" && method === "POST") {
+        return adminUpsertGameTag(request, env);
+      }
+
+      if (path === "/admin/api/game-tags/delete" && method === "POST") {
+        return adminDeleteGameTag(request, env);
+      }
         // Creator management
         if (path === "/admin/api/creators" && method === "GET") return adminListCreators(env);
         if (path === "/admin/api/creators/issue-token" && method === "POST") return adminIssueToken(request, env);
@@ -477,15 +501,40 @@ async function deleteExpiredAdminSessions(env) {
    Admin creator APIs
    ========================================================= */
 
-async function adminListCreators(env) {
-  const rows = await env.DB.prepare(
-    `SELECT id, display_name, email, youtube_channel, state, created_at, approved_at
-     FROM creators
-     ORDER BY created_at DESC`
-  ).all();
+  async function adminListCreators(env) {
+    const rows = await env.DB.prepare(
+      `SELECT c.id, c.display_name, c.email, c.youtube_channel, c.state, c.created_at, c.approved_at,
+              cat.game_tag AS allowed_tag
+      FROM creators c
+      LEFT JOIN creator_allowed_tags cat
+        ON cat.creator_id = c.id
+      ORDER BY c.created_at DESC`
+    ).all();
 
-  return json({ creators: rows.results ?? [] }, 200, { "cache-control": "no-store" });
-}
+    // Group rows into creators with allowed_tags[]
+    const map = new Map();
+
+    for (const r of (rows.results ?? [])) {
+      if (!map.has(r.id)) {
+        map.set(r.id, {
+          id: r.id,
+          display_name: r.display_name,
+          email: r.email,
+          youtube_channel: r.youtube_channel,
+          state: r.state,
+          created_at: r.created_at,
+          approved_at: r.approved_at,
+          allowed_tags: [],
+        });
+      }
+      if (r.allowed_tag) {
+        map.get(r.id).allowed_tags.push(r.allowed_tag);
+      }
+    }
+
+    const creators = Array.from(map.values());
+    return json({ creators }, 200, { "cache-control": "no-store" });
+  }
 
 async function adminIssueToken(request, env) {
   const body = await safeJson(request);
@@ -568,7 +617,67 @@ async function adminSetAllowedTags(request, env) {
 
   return json({ ok: true }, 200, { "cache-control": "no-store" });
 }
+  async function adminListGameTags(env) {
+    const rows = await env.DB.prepare(
+      `SELECT tag, label
+      FROM game_tags
+      ORDER BY tag ASC`
+    ).all();
 
+    return json({ ok: true, tags: rows.results ?? [] }, 200, { "cache-control": "no-store" });
+  }
+
+  async function adminUpsertGameTag(request, env) {
+    const body = await safeJson(request);
+    if (!body) return json({ error: "Invalid JSON" }, 400, { "cache-control": "no-store" });
+
+    const tag = typeof body.tag === "string" ? body.tag.trim() : "";
+    const label = typeof body.label === "string" ? body.label.trim() : "";
+
+    // Tag is the stable identifier used everywhere; keep it strict.
+    if (!tag) return json({ error: "Missing tag" }, 400, { "cache-control": "no-store" });
+    if (!/^[a-z0-9][a-z0-9-_]{1,48}$/.test(tag)) {
+      return json({ error: "Invalid tag format. Use lowercase letters, numbers, '-' or '_' (2-49 chars)." }, 400, { "cache-control": "no-store" });
+    }
+
+    await env.DB.prepare(
+      `INSERT INTO game_tags (tag, label)
+      VALUES (?, ?)
+      ON CONFLICT(tag) DO UPDATE SET label = excluded.label`
+    ).bind(tag, label || null).run();
+
+    return json({ ok: true }, 200, { "cache-control": "no-store" });
+  }
+
+  async function adminDeleteGameTag(request, env) {
+    const body = await safeJson(request);
+    if (!body) return json({ error: "Invalid JSON" }, 400, { "cache-control": "no-store" });
+
+    const tag = typeof body.tag === "string" ? body.tag.trim() : "";
+    if (!tag) return json({ error: "Missing tag" }, 400, { "cache-control": "no-store" });
+
+    // Block delete if in use by creators
+    const inCreators = await env.DB.prepare(
+      `SELECT 1 AS ok FROM creator_allowed_tags WHERE game_tag = ? LIMIT 1`
+    ).bind(tag).first();
+
+    if (inCreators) {
+      return json({ error: "Tag is assigned to creators; remove assignments first." }, 409, { "cache-control": "no-store" });
+    }
+
+    // Block delete if used by videos (historic integrity)
+    const inVideos = await env.DB.prepare(
+      `SELECT 1 AS ok FROM videos WHERE game_tag = ? LIMIT 1`
+    ).bind(tag).first();
+
+    if (inVideos) {
+      return json({ error: "Tag is used by videos; cannot delete." }, 409, { "cache-control": "no-store" });
+    }
+
+    await env.DB.prepare(`DELETE FROM game_tags WHERE tag = ?`).bind(tag).run();
+
+    return json({ ok: true }, 200, { "cache-control": "no-store" });
+  }
 /* =========================================================
    Creator auth/session (Creators table)
    ========================================================= */
